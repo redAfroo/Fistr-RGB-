@@ -1,0 +1,213 @@
+#include <FastLED.h>
+#include <Wire.h>
+#include "I2C_Anything.h"
+
+#define LED_PIN     7
+#define NUM_LEDS    138
+
+const byte MY_ADDRESS = 42;
+
+int LF_idx = 103;
+int RF_idx = 132;
+int RB_idx = 34;
+int LB_idx = 63;
+
+int F_len = abs(RF_idx - LF_idx);
+int L_len = abs(LF_idx - LB_idx);
+int B_len = abs(RB_idx - LB_idx);
+int R_len = abs(RB_idx + NUM_LEDS - RF_idx);
+
+CRGB leds[NUM_LEDS];
+
+struct Corners {
+  int LF;
+  int RF;
+  int LB;
+  int RB;
+};
+
+struct StepSize {
+  float right;
+  float back;
+  float left;
+  float front;
+};
+
+volatile boolean haveData = false;
+volatile float LF_value = 0;
+volatile float RF_value = 0;
+volatile float LB_value = 0;
+volatile float RB_value = 0;
+
+float alpha = 0.07;
+float smoothed_LF_value = 0;
+float smoothed_RF_value = 0;
+float smoothed_LB_value = 0;
+float smoothed_RB_value = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+
+  Wire.begin(MY_ADDRESS);
+  Wire.onReceive(receiveEvent);
+}
+
+void loop() {
+  if (haveData) {
+    float LF_value_s = LF_value;
+    float RF_value_s = RF_value;
+    float LB_value_s = LB_value;
+    float RB_value_s = RB_value;
+
+    // Moving average filter to "add delay"
+    smoothed_LF_value = (1.0-alpha)*smoothed_LF_value + alpha*LF_value_s + 2000;
+    smoothed_RF_value = (1.0-alpha)*smoothed_RF_value + alpha*RF_value_s + 2000;
+    smoothed_LB_value = (1.0-alpha)*smoothed_LB_value + alpha*LB_value_s + 2000;
+    smoothed_RB_value = (1.0-alpha)*smoothed_RB_value + alpha*RB_value_s + 2000;
+
+    // Find maximum value to use as reference
+    float s_max = findMax(smoothed_LF_value, smoothed_RF_value, smoothed_LB_value, smoothed_RB_value);
+
+    // Get the Red, Green and Blue values for each corner
+    Corners red = getCornerValues(0, 255, s_max);
+    Corners green = getCornerValues(255, 0, s_max);
+    Corners blue = getCornerValues(0, 0, s_max);
+
+    // Get step size to use for each side and color - used for interpolation
+    StepSize redStepSize = getStepSize(red);
+    StepSize greenStepSize = getStepSize(green);
+    StepSize blueStepSize = getStepSize(blue);
+
+    // Generate Back RGB
+    for (int i = 0; i < B_len; i++)
+    {
+      float r = getColorValue(i, red.RB, redStepSize.back);
+      float g = getColorValue(i, green.RB, greenStepSize.back);
+      float b = getColorValue(i, blue.RB, blueStepSize.back);
+      leds[i + RB_idx] = CRGB(
+        ( r > 255 ) ? 255 : r, 
+        ( g > 255 ) ? 255 : g, 
+        ( b > 255 ) ? 255 : b
+      );
+    }
+      
+    // Generate Left RGB
+    for (int i = 0; i < L_len; i++)
+    {
+      float r = getColorValue(i, red.LB, redStepSize.left);
+      float g = getColorValue(i, green.LB, greenStepSize.left);
+      float b = getColorValue(i, blue.LB, blueStepSize.left); 
+      leds[i + LB_idx] = CRGB(
+        ( r > 255 ) ? 255 : r, 
+        ( g > 30 ) ? 255 : g, 
+        ( b > 255 ) ? 255 : b 
+      );
+    }
+
+    // Generate Front RGB
+    for (int i = 0; i < F_len; i++)
+    {
+      leds[i + LF_idx] = CRGB(
+        getColorValue(i, red.LF, redStepSize.front), 
+        getColorValue(i, green.LF, greenStepSize.front), 
+        getColorValue(i, blue.LF, blueStepSize.front)
+      );
+    }
+      
+    // Generate Right RGB
+    for (int i = 0; i < R_len; i++)
+    {
+      if (i + RF_idx < NUM_LEDS) {
+          leds[i + RF_idx] = CRGB(
+            getColorValue(i, red.RF, redStepSize.right),
+            getColorValue(i, green.RF, greenStepSize.right), 
+            getColorValue(i, blue.RF, blueStepSize.right)
+          );
+      } else {
+          leds[i - (NUM_LEDS - RF_idx)] = CRGB(
+            getColorValue(i, red.RF, redStepSize.right),
+            getColorValue(i, green.RF, greenStepSize.right), 
+            getColorValue(i, blue.RF, blueStepSize.right)
+          );
+      }
+    }
+
+    FastLED.show();
+
+    haveData = false;
+  }
+}
+
+
+void receiveEvent(int howMany)
+{
+  if (howMany >= (sizeof LF_value) + (sizeof RF_value) + (sizeof LB_value) + (sizeof RB_value))
+  {
+    I2C_readAnything(LF_value);
+    I2C_readAnything(RF_value);
+    I2C_readAnything(LB_value);
+    I2C_readAnything(RB_value);
+    haveData = true;
+  } 
+}
+
+int getColorValue(int idx, int startCorner, float stepSize) {
+  return startCorner + static_cast<int>(idx * stepSize);
+}
+
+Corners getCornerValues(float colorMin, float colorMax, float sensorMax) {
+  int p_LF = mapf(smoothed_LF_value, 0, sensorMax, colorMin, colorMax);
+  int p_RF = mapf(smoothed_RF_value, 0, sensorMax, colorMin, colorMax);
+  int p_RB = mapf(smoothed_RB_value, 0, sensorMax, colorMin, colorMax);
+  int p_LB = mapf(smoothed_LB_value, 0, sensorMax, colorMin, colorMax);
+
+  Corners corners {
+    p_LF,
+    p_RF,
+    p_LB,
+    p_RB
+  };
+
+  return corners;
+}
+
+StepSize getStepSize(Corners corners) {
+  float B_stepSize = static_cast<float>(corners.LB - corners.RB) / (B_len - 1);
+  float L_stepSize = static_cast<float>(corners.LF - corners.LB) / (L_len - 1);
+  float F_stepSize = static_cast<float>(corners.RF - corners.LF) / (F_len - 1);
+  float R_stepSize = static_cast<float>(corners.RB - corners.RF) / (R_len - 1);
+
+  StepSize stepSize = {
+    R_stepSize,
+    B_stepSize,
+    L_stepSize,
+    F_stepSize
+  };
+
+  return stepSize;
+}
+
+float findMax(float a, float b, float c, float d) {
+  float maxVal = a;
+
+  if (b > maxVal) {
+    maxVal = b;
+  }
+
+  if (c > maxVal) {
+    maxVal = c;
+  }
+
+  if (d > maxVal) {
+    maxVal = d;
+  }
+
+  return maxVal;
+}
+
+float mapf(float x, float in_min, float in_max, float out_min, float out_max)
+{
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
